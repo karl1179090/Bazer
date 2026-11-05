@@ -1,0 +1,17 @@
+{
+  "Accessory Category": "Headset",
+  "Accessory Identifier": "REDACTED-ACCESSORY-A",
+  "Current Capacity": 30,
+  "Is Charged": false,
+  "Is Charging": 0,
+  "Is Present": true,
+  "Low Warn Level": 20,
+  "Max Capacity": 100,
+  "Name": "ACEFAST ACEFIT Air",
+  "Part Identifier": "Single",
+  "Power Source ID": 1,
+  "Power Source State": "Battery Power",
+  "Time to Full Charge": -1,
+  "Transport Type": "Bluetooth",
+  "Type": "Accessory Source"
+}

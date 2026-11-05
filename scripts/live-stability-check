@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Explicit, read-only macOS process observation. Never launches an app or HID query."""
+
+import argparse
+import ctypes
+import datetime
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def bounded_number(value, lower, upper):
+    number = float(value)
+    if not math.isfinite(number) or not lower <= number <= upper:
+        raise argparse.ArgumentTypeError(f"must be finite and in [{lower}, {upper}]")
+    return number
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pid", type=int, required=True, help="existing process PID; never discovered or launched")
+    parser.add_argument("--expected-binary", type=Path, required=True, help="absolute path of the running executable")
+    parser.add_argument("--expected-sha256", help="optional expected executable SHA256")
+    parser.add_argument("--duration", type=lambda v: bounded_number(v, 0.1, 86400), default=1800.0,
+                        help="seconds, default 1800; shorter runs are labeled smoke")
+    parser.add_argument("--interval", type=lambda v: bounded_number(v, 0.1, 60), default=10.0)
+    parser.add_argument("--output", type=Path, required=True, help="new NDJSON file; existing files are refused")
+    parser.add_argument("--sample-seconds", type=int, choices=range(0, 11), default=0,
+                        help="optional read-only macOS sample at end, 1–10 seconds; default off")
+    args = parser.parse_args()
+    if platform.system() != "Darwin":
+        parser.error("macOS is required (ps and libproc)")
+    if args.pid <= 0:
+        parser.error("--pid must be positive")
+    if not args.expected_binary.is_absolute():
+        parser.error("--expected-binary must be absolute")
+    if args.expected_sha256 and (len(args.expected_sha256) != 64 or
+                               any(c not in "0123456789abcdefABCDEF" for c in args.expected_sha256)):
+        parser.error("--expected-sha256 must contain 64 hexadecimal characters")
+    try:
+        binary = args.expected_binary.resolve(strict=True)
+        if not binary.is_file():
+            raise ValueError("expected binary is not a regular file")
+        initial_hash = sha256(binary)
+        if args.expected_sha256 and initial_hash != args.expected_sha256.lower():
+            raise ValueError("expected binary SHA256 mismatch")
+        output = args.output.expanduser().absolute()
+        if not output.parent.is_dir():
+            raise ValueError("output parent directory must already exist")
+        sample_path = Path(str(output) + ".sample.txt")
+        if args.sample_seconds and (sample_path.exists() or sample_path.is_symlink()):
+            raise ValueError("optional sample output already exists")
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libproc.proc_pidpath.restype = ctypes.c_int
+
+        def process_path():
+            buffer = ctypes.create_string_buffer(4096)
+            if libproc.proc_pidpath(args.pid, buffer, len(buffer)) <= 0:
+                raise RuntimeError(f"PID {args.pid} no longer accessible (libproc errno {ctypes.get_errno()})")
+            return Path(os.fsdecode(buffer.value)).resolve()
+
+        def observe():
+            if process_path() != binary:
+                raise RuntimeError("PID executable path differs from --expected-binary")
+            result = subprocess.run(
+                ["/bin/ps", "-p", str(args.pid), "-o", "pid=", "-o", "%cpu=", "-o", "rss=",
+                 "-o", "state=", "-o", "time=", "-o", "lstart="],
+                capture_output=True, text=True, timeout=5, env={**os.environ, "LC_ALL": "C"})
+            fields = result.stdout.strip().split(maxsplit=5)
+            if result.returncode or len(fields) != 6 or int(fields[0]) != args.pid:
+                raise RuntimeError(f"ps observation failed: {result.stderr.strip() or result.stdout.strip()}")
+            if process_path() != binary:
+                raise RuntimeError("PID identity changed during observation")
+            if sha256(binary) != initial_hash:
+                raise RuntimeError("executable file SHA256 changed during observation")
+            cpu, rss = float(fields[1]), int(fields[2])
+            if not math.isfinite(cpu) or cpu < 0 or rss < 0 or "Z" in fields[3]:
+                raise RuntimeError("invalid process metrics or zombie state")
+            return {"pid": args.pid, "cpuPercent": cpu, "rssKiB": rss, "state": fields[3],
+                    "cpuTime": fields[4], "processStartedAtLocal": fields[5], "alive": True}
+
+        first = observe()
+        start_identity = first["processStartedAtLocal"]
+        # Exclusive create prevents accidental destruction or mixing independent runs.
+        stream = output.open("x", encoding="utf-8", buffering=1)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"preflight failed: {error}", file=sys.stderr)
+        return 2
+
+    started = time.monotonic()
+    samples = []
+    failure = None
+    interrupted = False
+
+    def emit(record):
+        stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+
+    emit({"type": "start", "recordedAt": utc_now(), "pid": args.pid, "expectedBinary": str(binary),
+          "binarySHA256": initial_hash, "durationSeconds": args.duration, "intervalSeconds": args.interval,
+          "mode": "stability" if args.duration >= 1800 else "smoke", "readOnly": True,
+          "launchesApp": False, "queriesHID": False, "injectsTelemetry": False,
+          "clock": "time.monotonic (elapsed observation; sleep/awake state is not measured)",
+          "cpuMeaning": "ps %cpu snapshot; summary mean is an arithmetic sample mean",
+          "processStartedAtLocal": start_identity, "host": {"system": platform.system(),
+          "release": platform.release(), "machine": platform.machine()}})
+    print(f"Observing PID {args.pid}; {args.duration:g}s; output {output}", flush=True)
+    try:
+        index = 0
+        while True:
+            observation = first if index == 0 else observe()
+            if observation["processStartedAtLocal"] != start_identity:
+                raise RuntimeError("PID start time changed (possible PID reuse)")
+            elapsed = time.monotonic() - started
+            observation.update(type="observation", recordedAt=utc_now(), elapsedSeconds=round(elapsed, 6))
+            emit(observation)
+            samples.append(observation)
+            if elapsed >= args.duration:
+                break
+            index += 1
+            target = min(index * args.interval, args.duration)
+            time.sleep(max(0, started + target - time.monotonic()))
+    except KeyboardInterrupt:
+        interrupted = True
+        failure = "monitor interrupted; requested duration not completed"
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        failure = str(error)
+
+    elapsed = time.monotonic() - started
+    sample_result = None
+    if failure is None and args.sample_seconds:
+        try:
+            # sample itself overwrites its -file path. Give it a private temporary
+            # path, then publish with atomic, no-replace link creation. A file or
+            # symlink appearing during the observation is never overwritten.
+            with tempfile.TemporaryDirectory(prefix=".bazer-sample-", dir=output.parent) as temporary:
+                private_sample = Path(temporary) / "sample.txt"
+                result = subprocess.run(["/usr/bin/sample", str(args.pid), str(args.sample_seconds), "1",
+                                         "-file", str(private_sample)], capture_output=True, text=True,
+                                        timeout=args.sample_seconds + 20)
+                sample_result = {"exitCode": result.returncode, "path": str(sample_path),
+                                 "published": False, "stderr": result.stderr.strip()}
+                if result.returncode:
+                    failure = "optional sample command failed"
+                else:
+                    os.link(private_sample, sample_path)
+                    sample_result["published"] = True
+                    if observe()["processStartedAtLocal"] != start_identity:
+                        failure = "PID identity changed during optional sample"
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            failure = f"optional sample failed: {error}"
+    cpu_values = [s["cpuPercent"] for s in samples]
+    rss_values = [s["rssKiB"] for s in samples]
+    summary = {"type": "summary", "recordedAt": utc_now(), "pid": args.pid,
+               "completed": failure is None and elapsed >= args.duration,
+               "failure": failure, "requestedDurationSeconds": args.duration,
+               "elapsedSeconds": round(elapsed, 6), "observationCount": len(samples),
+               "qualifiesForThirtyMinuteObservation": failure is None and args.duration >= 1800 and elapsed >= 1800,
+               "continuousAwakeVerified": False, "uiResponsivenessVerified": False,
+               "hardwareBehaviorVerified": False, "optionalSample": sample_result,
+               "cpuPercent": {"min": min(cpu_values), "max": max(cpu_values), "sampleMean": statistics.mean(cpu_values)},
+               "rssKiB": {"first": rss_values[0], "last": rss_values[-1], "min": min(rss_values),
+                          "max": max(rss_values), "lastMinusFirst": rss_values[-1] - rss_values[0]}}
+    emit(summary)
+    stream.close()
+    print(json.dumps(summary, ensure_ascii=False, allow_nan=False), flush=True)
+    return 130 if interrupted else (1 if failure else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

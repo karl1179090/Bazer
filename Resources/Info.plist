@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleDisplayName</key><string>Bazer</string>
+    <key>CFBundleExecutable</key><string>BazerApp</string>
+    <key>CFBundleIdentifier</key><string>local.karl.Bazer</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>Bazer</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>7</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>Bazer 只读取已配对且已连接耳机的连接状态与系统电量，不扫描附近设备或主动配对。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key><string>Bazer 读取已连接耳机的连接状态与系统电量。</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>

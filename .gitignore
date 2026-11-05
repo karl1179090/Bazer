@@ -1,0 +1,21 @@
+# OS files
+.DS_Store
+
+# Build artifacts
+.build/
+.swiftpm/
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+*.dSYM/
+*.o
+*.log
+*.pcm
+
+# Docs & test/diagnostics outputs
+docs/
+output/
+
+# Antigravity agent files
+.agents/
